@@ -20,6 +20,7 @@ use molecule::prelude::Reader;
 use secp256k1::SecretKey;
 use serde::export::Clone;
 use shellexpand::tilde;
+use sparse_merkle_tree::traits::Value;
 use std::ops::Add;
 use std::str::FromStr;
 use web3::types::{Block, BlockHeader, U64};
@@ -224,14 +225,8 @@ impl ETHRelayer {
             start_index = last_cell_latest_height - CONFIRM as u64;
         }
 
-        log::info!(
-            "start relaying headers from {} to {}",
-            start_index,
-            tip_header_number
-        );
-
-        for number in (start_index..=tip_header_number).rev() {
-            log::info!("sync eth block {} to cache", number);
+        let mut number = tip_header_number;
+        while number >= start_index {
             let block_number = U64([number]);
 
             let mut key = [0u8; 32];
@@ -242,10 +237,39 @@ impl ETHRelayer {
             let chain_block = self.eth_client.get_block(block_number.into()).await?;
             let chain_block_hash = chain_block.hash.expect("block hash should not be none");
 
-            smt_tree
-                .update(key.into(), chain_block_hash.0.into())
-                .expect("update smt tree");
+            let db_block_hash = smt_tree.get(&key.into()).expect("should return ok");
+            if chain_block_hash.0.as_slice() != db_block_hash.to_h256().as_slice() {
+                smt_tree
+                    .update(key.into(), chain_block_hash.0.into())
+                    .expect("update smt tree");
+            } else {
+                break;
+            }
+            number = number - 1;
         }
+
+        log::info!(
+            "start relaying headers from {} to {}",
+            number + 1,
+            tip_header_number
+        );
+
+        // for number in (start_index..=tip_header_number).rev() {
+        //     log::info!("sync eth block {} to cache", number);
+        //     let block_number = U64([number]);
+        //
+        //     let mut key = [0u8; 32];
+        //     let mut height = [0u8; 8];
+        //     height.copy_from_slice(number.to_le_bytes().as_ref());
+        //     key[..8].clone_from_slice(&height);
+        //
+        //     let chain_block = self.eth_client.get_block(block_number.into()).await?;
+        //     let chain_block_hash = chain_block.hash.expect("block hash should not be none");
+        //
+        //     smt_tree
+        //         .update(key.into(), chain_block_hash.0.into())
+        //         .expect("update smt tree");
+        // }
 
         let new_merkle_root = smt_tree.root().as_slice();
         let new_latest_height = tip_header_number;
