@@ -195,6 +195,30 @@ impl ETHRelayer {
 
         let mut last_cell_latest_height = 0u64;
 
+        // let db_dir = shellexpand::tilde(path.as_str()).into_owned();
+        // let db_path = Path::new(db_dir.as_str());
+        //
+        // let (start_height, mut smt_tree) = match db_path.exist() {
+        //     false => {
+        //         let (start_height, _, _) = parse_merkle_cell_data(last_cell_output_data.to_vec())?;
+        //         let rocksdb_store = rocksdb::RocksDBStore::new(db_path.clone());
+        //         (
+        //             start_height,
+        //             rocksdb::SMT::new(sparse_merkle_tree::H256::zero(), rocksdb_store),
+        //         )
+        //     }
+        //     true => {
+        //         let (start_height, latest_height, merkle_root) =
+        //             parse_merkle_cell_data(last_cell_output_data.to_vec())?;
+        //         last_cell_latest_height = latest_height;
+        //         let rocksdb_store = rocksdb::RocksDBStore::open(db_path.clone());
+        //         (
+        //             start_height,
+        //             rocksdb::SMT::new(merkle_root.into(), rocksdb_store),
+        //         )
+        //     }
+        // };
+
         let (start_height, mut smt_tree) = match last_cell_output_data.len() {
             0 => {
                 let rocksdb_store = rocksdb::RocksDBStore::new(db_path.clone());
@@ -215,18 +239,8 @@ impl ETHRelayer {
             }
         };
 
-        // 1. if first time update eth light client, only update latest header
-        // 2. if last cell latest height not exceed CONFIRM, update block from 1 to latest
-        // 3. if last cell latest height over CONFIRM, update block from last_cell_latest_height - CONFIRM to latest
-        let mut start_index = start_height;
-        if last_cell_latest_height <= CONFIRM as u64 && last_cell_latest_height > 0 {
-            start_index = 1;
-        } else if last_cell_latest_height > CONFIRM as u64 {
-            start_index = last_cell_latest_height - CONFIRM as u64;
-        }
-
         let mut number = tip_header_number;
-        while number >= start_index {
+        while number >= start_height {
             let block_number = U64([number]);
 
             let mut key = [0u8; 32];
@@ -253,23 +267,6 @@ impl ETHRelayer {
             number + 1,
             tip_header_number
         );
-
-        // for number in (start_index..=tip_header_number).rev() {
-        //     log::info!("sync eth block {} to cache", number);
-        //     let block_number = U64([number]);
-        //
-        //     let mut key = [0u8; 32];
-        //     let mut height = [0u8; 8];
-        //     height.copy_from_slice(number.to_le_bytes().as_ref());
-        //     key[..8].clone_from_slice(&height);
-        //
-        //     let chain_block = self.eth_client.get_block(block_number.into()).await?;
-        //     let chain_block_hash = chain_block.hash.expect("block hash should not be none");
-        //
-        //     smt_tree
-        //         .update(key.into(), chain_block_hash.0.into())
-        //         .expect("update smt tree");
-        // }
 
         let new_merkle_root = smt_tree.root().as_slice();
         let new_latest_height = tip_header_number;
