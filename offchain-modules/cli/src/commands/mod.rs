@@ -3,6 +3,7 @@ use dapp::dapp_handle;
 use force_eth_lib::header_relay::ckb_relay::CKBRelayer;
 use force_eth_lib::header_relay::eth_relay::{wait_header_sync_success, ETHRelayer};
 use force_eth_lib::monitor::relay_monitor::RelayMonitor;
+use force_eth_lib::rocksdb::eth_rocksdb::ETHRocksdb;
 use force_eth_lib::transfer::to_ckb::{
     self, approve, generate_eth_spv_proof_json, get_or_create_bridge_cell, init_multi_sign_address,
     lock_eth, lock_token, send_eth_spv_proof_tx,
@@ -56,6 +57,7 @@ pub async fn handler(opt: Opts) -> Result<()> {
         SubCommand::CkbRelay(args) => ckb_relay_handler(args).await,
         SubCommand::RelayerMonitor(args) => relayer_monitor(args).await,
         SubCommand::Dapp(dapp_command) => dapp_handle(dapp_command).await,
+        SubCommand::EthRocksdbRelay(args) => eth_rocksdb_handler(args).await,
     }
 }
 
@@ -390,6 +392,19 @@ pub async fn eth_relay_handler(args: EthRelayArgs) -> Result<()> {
     )?;
     loop {
         let res = eth_relayer.start().await;
+        if let Err(err) = res {
+            error!("An error occurred during the eth relay. Err: {:?}", err)
+        }
+        tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+pub async fn eth_rocksdb_handler(args: EthRocksdbArgs) -> Result<()> {
+    debug!("eth_rocksdb_handler args: {:?}", &args);
+    let config_path = tilde(args.config_path.as_str()).into_owned();
+    let mut eth_rocksdb = ETHRocksdb::new(config_path, args.network)?;
+    loop {
+        let res = eth_rocksdb.start().await;
         if let Err(err) = res {
             error!("An error occurred during the eth relay. Err: {:?}", err)
         }

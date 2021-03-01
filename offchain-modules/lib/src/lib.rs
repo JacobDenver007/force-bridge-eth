@@ -4,6 +4,7 @@
 pub mod dapp;
 pub mod header_relay;
 pub mod monitor;
+pub mod rocksdb;
 pub mod transfer;
 pub mod util;
 

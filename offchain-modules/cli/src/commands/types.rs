@@ -32,6 +32,7 @@ pub enum SubCommand {
     CkbRelay(CkbRelayArgs),
     RelayerMonitor(RelayerMonitorArgs),
     Dapp(DappCommand),
+    EthRocksdbRelay(EthRocksdbArgs),
 }
 
 #[derive(Clap, Clone, Debug)]
@@ -301,6 +302,14 @@ pub struct EthRelayArgs {
     pub private_key_path: String,
     #[clap(long)]
     pub multisig_privkeys: Vec<String>,
+}
+
+#[derive(Clap, Clone, Debug)]
+pub struct EthRocksdbArgs {
+    #[clap(long, default_value = "~/.force-bridge/config.toml")]
+    pub config_path: String,
+    #[clap(long)]
+    pub network: Option<String>,
 }
 
 #[derive(Clap, Clone, Debug)]
