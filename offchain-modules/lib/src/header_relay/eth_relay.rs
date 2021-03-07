@@ -184,7 +184,7 @@ impl ETHRelayer {
         }
 
         let force_config = ForceConfig::new(self.config_path.as_str())?;
-        let db_path = force_config.rocksdb_path;
+        let db_path = force_config.eth_rocksdb_path;
         // make tx
         let cell =
             get_live_cell_by_typescript(&mut self.generator.indexer_client, cell_script.clone())
@@ -239,28 +239,39 @@ impl ETHRelayer {
             }
         };
 
-        let mut number = tip_header_number;
-        while number >= start_height {
-            let block_number = U64([number]);
+        let mut index = tip_header_number;
+        while index >= start_height {
+            let block_number = U64([index]);
 
             let mut key = [0u8; 32];
             let mut height = [0u8; 8];
-            height.copy_from_slice(number.to_le_bytes().as_ref());
+            height.copy_from_slice(index.to_le_bytes().as_ref());
             key[..8].clone_from_slice(&height);
 
             let chain_block = self.eth_client.get_block(block_number.into()).await?;
-            let chain_block_hash = chain_block.hash.expect("block hash should not be none");
+            let chain_block_hash = chain_block
+                .hash
+                .ok_or_else(|| anyhow!("the block number is not exist."))?;
 
-            let db_block_hash = smt_tree.get(&key.into()).expect("should return ok");
-            if chain_block_hash.0.as_slice() != db_block_hash.to_h256().as_slice() {
+            let db_block_hash = smt_tree
+                .get(&key.into())
+                .map_err(|err| anyhow::anyhow!(err))?;
+
+            if db_block_hash.to_h256().as_slice() != chain_block_hash.0.as_ref() {
                 smt_tree
                     .update(key.into(), chain_block_hash.0.into())
-                    .expect("update smt tree");
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                log::info!("sync eth block {} to cache", index);
             } else {
                 break;
             }
-            number = number - 1;
+            index -= 1;
         }
+        log::info!(
+            "start relaying headers from {} to {}",
+            index + 1,
+            tip_header_number
+        );
 
         log::info!(
             "start relaying headers from {} to {}",
@@ -301,7 +312,7 @@ impl ETHRelayer {
             rocksdb_store.commit();
             info!(
                 "Successfully relayed the headers from {} to {}",
-                last_cell_latest_height, tip_header_number
+                index, tip_header_number
             );
             latest_submit_header_number = tip_header_number;
         }
@@ -332,7 +343,7 @@ impl ETHRelayer {
                     e
                 ),
             }
-            tokio::time::delay_for(std::time::Duration::from_secs(30)).await;
+            tokio::time::delay_for(std::time::Duration::from_secs(300)).await;
         }
     }
 
