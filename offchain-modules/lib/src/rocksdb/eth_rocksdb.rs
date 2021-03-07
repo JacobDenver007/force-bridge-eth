@@ -15,8 +15,6 @@ use std::path::Path;
 use std::str::FromStr;
 use web3::types::U64;
 
-pub const HEADER_LIMIT_IN_TX: usize = 14;
-
 pub struct ETHRocksdb {
     pub eth_client: Web3Client,
     pub generator: Generator,

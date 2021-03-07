@@ -6,9 +6,12 @@ use crate::dapp::db::indexer::{
     update_ckb_unconfirmed_block, update_cross_chain_height_info, update_eth_to_ckb_status,
     CkbToEthRecord, CkbUnConfirmedBlock, CrossChainHeightInfo, EthToCkbRecord,
 };
+use crate::header_relay::ckb_relay::CKBRelayer;
+use crate::util::ckb_tx_generator::Generator;
 use crate::util::ckb_util::{clear_0x, create_bridge_lockscript, parse_cell};
 use crate::util::config::{DeployedContracts, ForceConfig};
 use crate::util::eth_util::{convert_eth_address, Web3Client};
+use crate::util::rocksdb::open_rocksdb;
 use anyhow::{anyhow, Result};
 use ckb_jsonrpc_types::Uint128;
 use ckb_sdk::rpc::{BlockView, Transaction};
@@ -19,6 +22,7 @@ use ckb_types::prelude::{Builder, Entity, Pack};
 use force_eth_types::eth_recipient_cell::ETHRecipientDataView;
 use force_eth_types::generated::basic::ETHAddress;
 use force_sdk::indexer::IndexerRpcClient;
+use rocksdb::ops::{Get, Put};
 use shellexpand::tilde;
 use sqlx::MySqlPool;
 use web3::types::H160;
@@ -32,6 +36,7 @@ pub struct CkbIndexer {
     pub indexer_client: IndexerRpcClient,
     pub eth_client: Web3Client,
     pub db: MySqlPool,
+    pub ckb_init_height: u64,
 }
 
 impl CkbIndexer {
@@ -49,13 +54,96 @@ impl CkbIndexer {
         let indexer_client = IndexerRpcClient::new(ckb_indexer_url);
         let db = MySqlPool::connect(&db_path).await?;
         let eth_client = Web3Client::new(eth_rpc_url);
+
+        let mut ckb_client = Generator::new(
+            ckb_rpc_url.clone(),
+            ckb_indexer_url.clone(),
+            Default::default(),
+        )
+        .map_err(|e| anyhow!("failed to crate generator: {}", e))?;
+        let ckb_init_height = CKBRelayer::get_ckb_contract_deloy_height(
+            &mut ckb_client,
+            force_config
+                .deployed_contracts
+                .recipient_typescript
+                .outpoint
+                .tx_hash
+                .clone(),
+        )?;
+
         Ok(CkbIndexer {
             config_path,
             rpc_client,
             indexer_client,
             eth_client,
             db,
+            ckb_init_height,
         })
+    }
+
+    pub async fn relay_rocksdb(&mut self, latest_height: u64) -> Result<()> {
+        let config_path = tilde(config_path.as_str()).into_owned();
+        let force_config = ForceConfig::new(config_path.as_str())?;
+
+        let db = open_rocksdb(force_config.ckb_rocksdb_path);
+
+        let mut index = latest_height;
+        while index >= self.ckb_init_height {
+            match self
+                .rpc_client
+                .get_block_by_number(index)
+                .map_err(|e| anyhow!("get_header_by_number err: {:?}", e))?
+            {
+                Some(block_view) => {
+                    for tx in block_view.transactions {
+                        if tx.inner.outputs_data.is_empty() {
+                            continue;
+                        }
+                        let output_data = tx.inner.outputs_data[0].as_bytes();
+                        if ETHRecipientDataView::new(&output_data).is_ok() {
+                            self.last_burn_tx_height = index;
+                            self.waiting_burn_txs_count += 1;
+                            break;
+                        }
+                    }
+
+                    let header_view = block_view.header;
+
+                    let chain_root = header_view.inner.transactions_root.0;
+
+                    let db_root_option = db.get(index.to_le_bytes()).map_err(|err| anyhow!(err))?;
+
+                    let db_root = match db_root_option {
+                        Some(v) => {
+                            let mut db_root_raw = [0u8; 32];
+                            db_root_raw.copy_from_slice(v.as_ref());
+                            db_root_raw
+                        }
+                        None => [0u8; 32],
+                    };
+
+                    if chain_root.to_vec() != db_root {
+                        db.put(index.to_le_bytes(), chain_root.to_vec())
+                            .map_err(|err| anyhow!(err))?;
+                    } else {
+                        break;
+                    }
+                    index -= 1;
+                }
+                None => {
+                    bail!(
+                        "cannot get the block transactions root, block_number = {}",
+                        index
+                    );
+                }
+            }
+        }
+        info!(
+            "store ckb headers from {:?} to {:?}",
+            index + 1,
+            latest_height
+        );
+        Ok(())
     }
 
     pub async fn start(&mut self) -> Result<()> {

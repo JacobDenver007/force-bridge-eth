@@ -12,6 +12,7 @@ use crate::util::ckb_util::{clear_0x, parse_cell, parse_merkle_cell_data};
 use crate::util::config::ForceConfig;
 use crate::util::eth_util::{convert_hex_to_h256, Web3Client};
 use crate::util::generated::ckb_tx_proof::CKBUnlockTokenParamReader;
+use crate::util::rocksdb;
 use anyhow::{anyhow, Result};
 use ckb_hash::blake2b_256;
 use ckb_jsonrpc_types::Uint128;
@@ -25,7 +26,9 @@ use rusty_receipt_proof_maker::{
     generate_eth_proof, parse_event, parse_unlock_event, types::EthSpvProof,
 };
 use shellexpand::tilde;
+use sparse_merkle_tree::traits::Value;
 use sqlx::MySqlPool;
+use std::path::Path;
 use web3::types::{Block, H256, U64};
 
 pub const ETH_CHAIN_CONFIRMED: usize = 15;
@@ -61,7 +64,68 @@ impl<T: IndexerFilter> EthIndexer<T> {
         })
     }
 
-    pub async fn get_light_client_height(&mut self) -> Result<u64> {
+    pub async fn relay_rocksdb(&mut self, mut latest_submit_header_number: u64) -> Result<u64> {
+        let config_path = tilde(self.config_path.as_str()).into_owned();
+        let force_config = ForceConfig::new(config_path.as_str())?;
+
+        let (start_height, latest_height, merkle_root) = self.get_light_client_height().await;
+        if latest_submit_header_number >= latest_height {
+            info!(
+                "waiting for new eth header. latest_height: {}, latest_submit_header_number: {}",
+                latest_height, latest_submit_header_number
+            );
+            return Ok(latest_submit_header_number);
+        }
+
+        let eth_rocksdb_path = force_config.eth_rocksdb_path;
+        let db_dir = tilde(eth_rocksdb_path.as_str()).into_owned();
+        let db_path = Path::new(db_dir.as_str());
+        let mut smt_tree = match db_path.exists() {
+            false => {
+                let rocksdb_store = rocksdb::RocksDBStore::new(eth_rocksdb_path.clone());
+                rocksdb::SMT::new(sparse_merkle_tree::H256::zero(), rocksdb_store)
+            }
+            true => {
+                let rocksdb_store = rocksdb::RocksDBStore::open(eth_rocksdb_path.clone());
+                rocksdb::SMT::new(merkle_root.into(), rocksdb_store)
+            }
+        };
+
+        let mut number = latest_height;
+        while number >= start_height {
+            let block_number = U64([number]);
+
+            let mut key = [0u8; 32];
+            let mut height = [0u8; 8];
+            height.copy_from_slice(number.to_le_bytes().as_ref());
+            key[..8].clone_from_slice(&height);
+
+            let chain_block = self.eth_client.get_block(block_number.into()).await?;
+            let chain_block_hash = chain_block.hash.expect("block hash should not be none");
+
+            let db_block_hash = smt_tree.get(&key.into()).expect("should return ok");
+            if chain_block_hash.0.as_slice() != db_block_hash.to_h256().as_slice() {
+                smt_tree
+                    .update(key.into(), chain_block_hash.0.into())
+                    .expect("update smt tree");
+            } else {
+                break;
+            }
+            number = number - 1;
+        }
+
+        let rocksdb_store = smt_tree.store_mut();
+        rocksdb_store.commit();
+        info!(
+            "Successfully relayed the headers from {} to {}",
+            number + 1,
+            latest_height
+        );
+        latest_submit_header_number = latest_height;
+        Ok(latest_submit_header_number)
+    }
+
+    pub async fn get_light_client_height(&mut self) -> Result<(u64, u64, [u8; 32])> {
         let config_path = tilde(self.config_path.as_str()).into_owned();
         let force_config = ForceConfig::new(config_path.as_str())?;
         let deployed_contracts = force_config
@@ -78,21 +142,22 @@ impl<T: IndexerFilter> EthIndexer<T> {
             .ok_or_else(|| anyhow!("the cell is not exist"))?;
         let ckb_cell_data = cell.output_data.as_bytes().to_vec();
         if !ckb_cell_data.is_empty() {
-            let (start_height, latest_height, _) = parse_merkle_cell_data(ckb_cell_data.to_vec())?;
+            let (start_height, latest_height, merkle_root) =
+                parse_merkle_cell_data(ckb_cell_data.to_vec())?;
             log::info!(
                 "get_light_client_height start_height: {:?}, latest_height: {:?}",
                 start_height,
                 latest_height
             );
 
-            return Ok(latest_height);
+            return Ok((start_height, latest_height, merkle_root));
         }
         anyhow::bail!("waiting for the block confirmed!")
     }
 
     pub async fn get_light_client_height_with_loop(&mut self) -> u64 {
         loop {
-            let ret = self.get_light_client_height().await;
+            let (_, ret, _) = self.get_light_client_height().await;
             match ret {
                 Ok(number) => {
                     return number;
